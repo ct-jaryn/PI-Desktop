@@ -246,3 +246,31 @@ describe("validateMcpCatalogFile", () => {
     expect(warnings.join("\n")).toContain("public https");
   });
 });
+
+
+describe("header-local token bindings", () => {
+  const entry: McpCatalogEntry = {
+    id: "scoped", name: "Scoped", transport: "http", url: "https://example.com/mcp",
+    headers: { "X-Test": "{literal} {input} {fixed}" },
+    headerBindings: { "X-Test": { "{input}": { input: "key" }, "{fixed}": { value: "{input}" } } },
+    requiredEnv: [{ name: "key" }],
+  };
+
+  it("collects editable references only and preserves literal replacements", () => {
+    expect(collectCatalogPlaceholders(entry)).toEqual(["key"]);
+    expect(resolveCatalogEntry(entry, { key: "synthetic" }).headers).toEqual({
+      "X-Test": "{literal} synthetic {input}",
+    });
+  });
+
+  it("validates input references and binding shapes", () => {
+    expect(catalogEntryError({ ...entry, requiredEnv: [] })).toContain("placeholder key is not declared");
+    for (const headerBindings of [
+      { "X-Unknown": {} },
+      { "X-Test": { "{input}": { input: "key", value: "both" } } },
+      { "X-Test": { "{input}": { input: 3 } } },
+      { "X-Test": { invalid: { value: "literal" } } },
+    ]) expect(catalogEntryError({ ...entry, headerBindings })).not.toBeNull();
+    expect(catalogEntryError({ ...entry, transport: "stdio", command: "node" })).toContain("requires http");
+  });
+});

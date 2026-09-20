@@ -20,6 +20,9 @@ export type McpCatalogRequiredEnv = {
   defaultValue?: string;
 };
 
+/** A registry header token resolves to a form input or a non-editable literal. */
+export type McpCatalogHeaderBinding = { input: string } | { value: string };
+
 export type McpCatalogEntry = {
   id: string;
   name: string;
@@ -36,6 +39,8 @@ export type McpCatalogEntry = {
   /** http template. Market endpoints must use credentials-free public HTTPS. */
   url?: string;
   headers?: Record<string, string>;
+  /** Header-local token bindings. Unbound text stays literal, including braces. */
+  headerBindings?: Record<string, Record<string, McpCatalogHeaderBinding>>;
   requiredEnv?: McpCatalogRequiredEnv[];
   prerequisites?: string[];
   notes?: string;
@@ -101,6 +106,22 @@ function requiredEnvError(value: unknown, id: string, transport: unknown): strin
   return null;
 }
 
+function headerBindingsError(value: unknown, headers: unknown, id: string): string | null {
+  if (!isRecord(value) || !isStringRecord(headers)) return `${id}: headerBindings requires headers`;
+  for (const [header, bindings] of Object.entries(value)) {
+    if (!Object.hasOwn(headers, header) || !isRecord(bindings)) return `${id}: invalid header bindings`;
+    for (const [token, binding] of Object.entries(bindings)) {
+      if (!/^\$?\{[A-Za-z_][A-Za-z0-9_]*\}$/.test(token) || !isRecord(binding) || Object.keys(binding).length !== 1) {
+        return `${id}: invalid header token binding`;
+      }
+      if (typeof binding.value !== "string" && (typeof binding.input !== "string" || !VARIABLE_NAME.test(binding.input))) {
+        return `${id}: header token binding requires an input or literal value`;
+      }
+    }
+  }
+  return null;
+}
+
 function entryShapeError(value: unknown): string | null {
   if (!isRecord(value)) return "entry is not an object";
   const id = typeof value.id === "string" ? value.id : "unknown";
@@ -116,6 +137,11 @@ function entryShapeError(value: unknown): string | null {
   if (value.args !== undefined && !isStringArray(value.args)) return `${id}: args must be an array of strings`;
   if (value.env !== undefined && !isStringRecord(value.env)) return `${id}: env must be an object of strings`;
   if (value.headers !== undefined && !isStringRecord(value.headers)) return `${id}: headers must be an object of strings`;
+  if (value.headerBindings !== undefined) {
+    if (value.transport !== "http") return `${id}: headerBindings requires http transport`;
+    const error = headerBindingsError(value.headerBindings, value.headers, id);
+    if (error) return error;
+  }
   if (value.prerequisites !== undefined && !isStringArray(value.prerequisites)) return `${id}: prerequisites must be an array of strings`;
   if (value.requiredEnv !== undefined) {
     const error = requiredEnvError(value.requiredEnv, id, value.transport);
@@ -143,14 +169,34 @@ function templateStrings(entry: McpCatalogEntry): string[] {
   ];
 }
 
-/** Every `${NAME}` the entry's install template needs, deduped and sorted. */
+/** Every editable input referenced by an install template, deduped and sorted. */
 export function collectCatalogPlaceholders(entry: McpCatalogEntry): string[] {
   const names = new Set<string>();
   const pattern = placeholderPattern(entry.transport);
-  for (const text of templateStrings(entry)) {
-    for (const match of text.matchAll(pattern)) names.add(match[1]);
+  const declared = declaredNames(entry);
+  const collect = (text: string, bindings?: Record<string, McpCatalogHeaderBinding>) => {
+    for (const match of text.matchAll(pattern)) {
+      if (bindings) {
+        const binding = Object.hasOwn(bindings, match[0]) ? bindings[match[0]] : undefined;
+        if (binding && "input" in binding) names.add(binding.input);
+      } else if (match[0].startsWith("$") || declared.has(match[1])) {
+        names.add(match[1]);
+      }
+    }
+  };
+  if (entry.transport === "http") {
+    collect(entry.url ?? "");
+    for (const [header, template] of Object.entries(entry.headers ?? {})) {
+      collect(template, bindingsForHeader(entry, header));
+    }
+  } else {
+    for (const text of templateStrings(entry)) collect(text);
   }
   return [...names].sort();
+}
+
+function bindingsForHeader(entry: McpCatalogEntry, header: string): Record<string, McpCatalogHeaderBinding> | undefined {
+  return entry.headerBindings && Object.hasOwn(entry.headerBindings, header) ? entry.headerBindings[header] : undefined;
 }
 
 function declaredNames(entry: McpCatalogEntry): Map<string, McpCatalogRequiredEnv> {
@@ -198,10 +244,18 @@ export function resolveCatalogEntry(
   if (error) throw new Error(error);
   const declared = declaredNames(entry);
   const pattern = placeholderPattern(entry.transport);
-  const fill = (text: string): string =>
+  const fill = (text: string, bindings?: Record<string, McpCatalogHeaderBinding>): string =>
     text.replace(pattern, (whole, name: string) => {
+      if (bindings) {
+        const binding = Object.hasOwn(bindings, whole) ? bindings[whole] : undefined;
+        if (!binding) return whole;
+        if ("value" in binding) return binding.value;
+        name = binding.input;
+      } else if (!whole.startsWith("$") && !declared.has(name)) {
+        return whole;
+      }
       const spec = declared.get(name);
-      const value = values[name] ?? spec?.defaultValue ?? "";
+      const value = (Object.hasOwn(values, name) ? values[name] : undefined) ?? spec?.defaultValue ?? "";
       if (!value && !spec?.optional) {
         throw new Error(`${entry.name}: missing value for ${name}`);
       }
@@ -216,7 +270,7 @@ export function resolveCatalogEntry(
   if (entry.transport === "http") {
     const headers: Record<string, string> = {};
     for (const [key, template] of Object.entries(entry.headers ?? {})) {
-      const value = fill(template);
+      const value = fill(template, bindingsForHeader(entry, key));
       if (value) headers[key] = value;
     }
     return { ...base, transport: "http", url: fill(entry.url!), headers };

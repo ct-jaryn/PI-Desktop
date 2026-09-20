@@ -112,7 +112,7 @@ const lowercasePlaceholderRecord: RegistryRecord = {
       {
         type: "streamable-http",
         url: "https://lowercase.example.com/mcp",
-        headers: [{ name: "Authorization", value: "Bearer {api_key}" }],
+        headers: [{ name: "Authorization", value: "Bearer {api_key}", variables: { api_key: { isRequired: true } } }],
       },
     ],
   },
@@ -217,6 +217,86 @@ describe("mapRegistryServer", () => {
   it("refuses to resolve an official header whose value is missing", () => {
     const entry = mapRegistryServer(officialPlaceholderRecord)!;
     expect(() => resolveCatalogEntry(entry, {})).toThrow(/missing value for CLOUD_API_KEY/);
+  });
+
+  it("preserves undeclared brace tokens, including a name declared in another header", () => {
+    const record: RegistryRecord = { server: { name: "io.example/literals", remotes: [{
+      type: "streamable-http", url: "https://example.com/mcp", headers: [
+        { name: "X-Literal", value: "{opaque} {token}" },
+        { name: "Authorization", value: "Bearer {token}", variables: { token: { isRequired: true } } },
+      ],
+    }] } };
+    const entry = mapRegistryServer(record)!;
+    expect(entry.requiredEnv).toEqual([{ name: "token" }]);
+    expect(resolveCatalogEntry(entry, { token: "synthetic" }).headers).toEqual({
+      "X-Literal": "{opaque} {token}", Authorization: "Bearer synthetic",
+    });
+  });
+
+  it("preserves undeclared braces beside a legacy dollar token with the same name", () => {
+    const record: RegistryRecord = { server: { name: "io.example/mixed", remotes: [{
+      type: "streamable-http", url: "https://example.com/mcp",
+      headers: [{ name: "X-Mixed", value: "{TOKEN} ${TOKEN}" }],
+    }] } };
+    expect(resolveCatalogEntry(mapRegistryServer(record)!, { TOKEN: "synthetic" }).headers).toEqual({
+      "X-Mixed": "{TOKEN} synthetic",
+    });
+  });
+
+  it("uses header variable defaults, allows overrides and defaults isRequired to false", () => {
+    const record: RegistryRecord = { server: { name: "io.example/defaults", remotes: [{
+      type: "streamable-http", url: "https://example.com/mcp", headers: [
+        { name: "X-Project", value: "{project}", variables: { project: { isRequired: true, default: "public" } } },
+        { name: "X-Optional", value: "{scope}", variables: { scope: { description: "Optional scope" } } },
+      ],
+    }] } };
+    const entry = mapRegistryServer(record)!;
+    expect(entry.requiredEnv).toContainEqual({ name: "scope", description: "Optional scope", optional: true });
+    expect(resolveCatalogEntry(entry).headers).toEqual({ "X-Project": "public" });
+    expect(resolveCatalogEntry(entry, { project: "custom" }).headers).toEqual({ "X-Project": "custom" });
+  });
+
+  it("keeps fixed variable values out of the form and does not interpret their contents", () => {
+    const record: RegistryRecord = { server: { name: "io.example/fixed", remotes: [{
+      type: "streamable-http", url: "https://example.com/mcp", headers: [{
+        name: "X-Fixed", value: "{fixed} {editable}", variables: {
+          fixed: { value: "${editable} {editable}", default: "ignored", isRequired: true },
+          editable: { isRequired: true },
+        },
+      }],
+    }] } };
+    const entry = mapRegistryServer(record)!;
+    expect(entry.requiredEnv).toEqual([{ name: "editable" }]);
+    expect(resolveCatalogEntry(entry, { fixed: "override", editable: "chosen" }).headers).toEqual({
+      "X-Fixed": "${editable} {editable} chosen",
+    });
+  });
+
+  it("keeps same-named header inputs independent and avoids generated-name collisions", () => {
+    const record: RegistryRecord = { server: { name: "io.example/scopes", remotes: [{
+      type: "streamable-http", url: "https://example.com/mcp", headers: [
+        { name: "X-Optional", value: "{token}", variables: { token: {} } },
+        { name: "Authorization", value: "Bearer {token}", variables: { token: { isRequired: true } } },
+        { name: "X-Collision", value: "{token_1}", variables: { token_1: { default: "one" } } },
+      ],
+    }] } };
+    const entry = mapRegistryServer(record)!;
+    expect(entry.requiredEnv).toHaveLength(3);
+    expect(new Set(entry.requiredEnv!.map(({ name }) => name)).size).toBe(3);
+    const required = entry.requiredEnv!.find(({ optional }) => !optional)!;
+    expect(() => resolveCatalogEntry(entry)).toThrow(`missing value for ${required.name}`);
+    expect(resolveCatalogEntry(entry, { [required.name]: "synthetic" }).headers).toEqual({
+      Authorization: "Bearer synthetic", "X-Collision": "one",
+    });
+  });
+
+  it("does not use inherited object properties as supplied input values", () => {
+    const record: RegistryRecord = { server: { name: "io.example/property", remotes: [{
+      type: "streamable-http", url: "https://example.com/mcp", headers: [{
+        name: "X-Input", value: "{constructor}", variables: { constructor: { isRequired: true } },
+      }],
+    }] } };
+    expect(() => resolveCatalogEntry(mapRegistryServer(record)!, {})).toThrow("missing value for constructor");
   });
 
   it("drops records without a runnable form", () => {
